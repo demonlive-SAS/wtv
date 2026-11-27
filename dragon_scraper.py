@@ -6,9 +6,13 @@ Dragon IPTV scraper
 - Writes dragon.m3u8 (sorted A-Z by tvg-name) and dragon.xml.gz (XMLTV EPG)
 """
 import asyncio
+import difflib
 import gzip
+import io
 import os
 import re
+import urllib.request
+import xml.etree.ElementTree as ET
 import sys
 from datetime import datetime, timedelta, timezone
 from xml.sax.saxutils import escape, quoteattr
@@ -23,6 +27,16 @@ OUTPUT_PLAYLISTS = {
     "dragon_jellyfin.m3u8": "jellyfin",
 }
 OUT_XML = "dragon.xml.gz"
+
+# tvg-ids are taken from this EPG; programme data for matched channels is copied from it
+EPG_SOURCE_URL = "https://iptv-epg.org/files/epg-us.xml.gz"
+MATCH_CUTOFF = 0.88  # fuzzy-match strictness (0-1); higher = stricter
+
+# Pin a channel to an exact EPG channel id when auto-matching is wrong or misses.
+# Format: "Our channel name": "channel id exactly as it appears in the EPG"
+TVG_ID_OVERRIDES = {
+    # "Comet TV": "CometTV.us",
+}
 
 CONCURRENCY = 4          # pages scraped in parallel
 PAGE_TIMEOUT_MS = 45000  # page load timeout
@@ -297,34 +311,129 @@ def write_m3u(entries):
     return entries
 
 
-def write_epg(entries):
-    """Minimal XMLTV: channel list + 4-hour placeholder blocks for the next 24h."""
+def norm(s):
+    """Normalise a channel name/id for matching."""
+    s = s.lower()
+    s = re.sub(r"\(.*?\)", " ", s)
+    s = re.sub(r"\b(hd|tv|channel|live|network|the|us|usa)\b", " ", s)
+    return re.sub(r"[^a-z0-9]+", "", s)
+
+
+def download_epg():
+    req = urllib.request.Request(EPG_SOURCE_URL, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=180) as resp:
+        return resp.read()
+
+
+def open_epg(data):
+    """Open downloaded bytes whether or not they are gzip-compressed."""
+    if data[:2] == b"\x1f\x8b":
+        return gzip.GzipFile(fileobj=io.BytesIO(data))
+    return io.BytesIO(data)
+
+
+def load_epg_channels(data):
+    """Return {channel_id: {"names": [...], "icon": url}} (XMLTV lists channels first)."""
+    chans = {}
+    for _, el in ET.iterparse(open_epg(data), events=("end",)):
+        if el.tag == "channel":
+            names = [d.text.strip() for d in el.findall("display-name") if d.text]
+            icon = el.find("icon")
+            chans[el.get("id")] = {
+                "names": names,
+                "icon": icon.get("src") if icon is not None else "",
+            }
+            el.clear()
+        elif el.tag == "programme":
+            break
+    return chans
+
+
+def assign_tvg_ids(entries, chans):
+    """Set e['tvg_id'] to the EPG channel id when a match is found."""
+    index = {}
+    for cid, info in chans.items():
+        keys = [norm(n) for n in info["names"]] + [norm(cid.split(".")[0])]
+        for key in keys:
+            if key:
+                index.setdefault(key, cid)
+
+    hits = 0
+    for e in entries:
+        e["epg_matched"] = False
+        cid = TVG_ID_OVERRIDES.get(e["name"])
+        if cid and cid not in chans:
+            print(f"[WARN] override for {e['name']} -> {cid} not found in EPG, ignoring")
+            cid = None
+        if not cid:
+            key = norm(e["name"])
+            cid = index.get(key)
+            if not cid and key:
+                close = difflib.get_close_matches(key, list(index), n=1, cutoff=MATCH_CUTOFF)
+                if close:
+                    cid = index[close[0]]
+        if cid:
+            e["tvg_id"] = cid
+            e["epg_matched"] = True
+            if not e["logo"]:
+                e["logo"] = chans[cid]["icon"]
+            hits += 1
+            print(f"[ID]   {e['name']} -> {cid}")
+        else:
+            print(f"[NOID] {e['name']} (no EPG match, using {e['tvg_id']})")
+    print(f"\nMatched {hits}/{len(entries)} channels to EPG ids")
+
+
+def write_epg(entries, epg_data=None):
+    """
+    dragon.xml.gz = real programmes copied from the source EPG for matched channels
+    + 4-hour placeholder blocks (next 24h) for channels with no EPG match.
+    """
     fmt = "%Y%m%d%H%M%S +0000"
     now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     start0 = now - timedelta(hours=now.hour % 4)
 
-    xml = ['<?xml version="1.0" encoding="UTF-8"?>', '<tv generator-info-name="dragon-scraper">']
-    for e in entries:
-        xml.append(f'  <channel id={quoteattr(e["tvg_id"])}>')
-        xml.append(f'    <display-name>{escape(e["name"])}</display-name>')
-        if e["logo"]:
-            xml.append(f'    <icon src={quoteattr(e["logo"])} />')
-        xml.append("  </channel>")
-    for e in entries:
-        for i in range(6):
-            s = start0 + timedelta(hours=4 * i)
-            t = s + timedelta(hours=4)
-            xml.append(
-                f'  <programme start="{s.strftime(fmt)}" stop="{t.strftime(fmt)}" '
-                f'channel={quoteattr(e["tvg_id"])}>'
-            )
-            xml.append(f'    <title lang="en">{escape(e["name"])} Live</title>')
-            xml.append(f'    <category lang="en">{escape(e["group"])}</category>')
-            xml.append("  </programme>")
-    xml.append("</tv>")
+    matched_ids = {e["tvg_id"] for e in entries if e.get("epg_matched")}
+    unmatched = [e for e in entries if not e.get("epg_matched")]
 
-    with gzip.open(OUT_XML, "wt", encoding="utf-8") as f:
-        f.write("\n".join(xml))
+    with gzip.open(OUT_XML, "wt", encoding="utf-8") as out:
+        out.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+        out.write('<tv generator-info-name="dragon-scraper">\n')
+
+        # channel elements for unmatched entries (all <channel> must precede <programme>)
+        for e in unmatched:
+            out.write(f'  <channel id={quoteattr(e["tvg_id"])}>\n')
+            out.write(f'    <display-name>{escape(e["name"])}</display-name>\n')
+            if e["logo"]:
+                out.write(f'    <icon src={quoteattr(e["logo"])} />\n')
+            out.write("  </channel>\n")
+
+        # stream matched channels + programmes straight from the source EPG
+        if epg_data and matched_ids:
+            for _, el in ET.iterparse(open_epg(epg_data), events=("end",)):
+                if el.tag == "channel":
+                    if el.get("id") in matched_ids:
+                        out.write(ET.tostring(el, encoding="unicode"))
+                    el.clear()
+                elif el.tag == "programme":
+                    if el.get("channel") in matched_ids:
+                        out.write(ET.tostring(el, encoding="unicode"))
+                    el.clear()
+
+        # placeholder programmes for unmatched channels
+        for e in unmatched:
+            for i in range(6):
+                s = start0 + timedelta(hours=4 * i)
+                t = s + timedelta(hours=4)
+                out.write(
+                    f'  <programme start="{s.strftime(fmt)}" stop="{t.strftime(fmt)}" '
+                    f'channel={quoteattr(e["tvg_id"])}>\n'
+                    f'    <title lang="en">{escape(e["name"])} Live</title>\n'
+                    f'    <category lang="en">{escape(e["group"])}</category>\n'
+                    f"  </programme>\n"
+                )
+
+        out.write("</tv>\n")
 
 
 def main():
@@ -332,11 +441,20 @@ def main():
     if not entries:
         print("No streams found; leaving existing files untouched.")
         sys.exit(1)
+
+    epg_data = None
+    try:
+        epg_data = download_epg()
+        chans = load_epg_channels(epg_data)
+        print(f"\nLoaded {len(chans)} channels from {EPG_SOURCE_URL}")
+        assign_tvg_ids(entries, chans)
+    except Exception as exc:
+        print(f"[WARN] EPG source unavailable ({exc}); using generated tvg-ids")
+
     entries = write_m3u(entries)
-    write_epg(entries)
+    write_epg(entries, epg_data)
     print(f"\nWrote {len(entries)}/{len(CHANNELS)} channels to {', '.join(OUTPUT_PLAYLISTS)} and {OUT_XML}")
 
 
 if __name__ == "__main__":
     main()
- 
