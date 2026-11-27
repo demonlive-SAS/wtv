@@ -16,6 +16,12 @@ from xml.sax.saxutils import escape, quoteattr
 from playwright.async_api import async_playwright
 
 OUT_M3U = "dragon.m3u8"
+OUTPUT_PLAYLISTS = {
+    OUT_M3U: "generic",
+    "dragon_vlc.m3u8": "vlc",
+    "dragon_tivimate.m3u8": "tivimate",
+    "dragon_jellyfin.m3u8": "jellyfin",
+}
 OUT_XML = "dragon.xml.gz"
 
 CONCURRENCY = 4          # pages scraped in parallel
@@ -98,12 +104,47 @@ def is_stream_candidate(url: str) -> bool:
     return ".m3u8" in low and not any(bad in low for bad in AD_BLOCKLIST)
 
 
-def pick_best(candidates):
-    """Prefer master/playlist/index manifests, otherwise first seen."""
+VIDEO_CODEC_RE = re.compile(r"avc1|hvc1|hev1|vp09|av01")
+AUDIO_URL_RE = re.compile(r"(audio|_a\d|-a\d|/a/|aac|radio|mp4a)")
+AUDIO_SEG_RE = re.compile(r"\.(aac|mp3|m4a|ac3|ec3)(\?|$)", re.I)
+
+
+async def score_candidate(context, url, referrer):
+    """Fetch the playlist and score it: video masters win, audio-only loses."""
+    score = -50 if AUDIO_URL_RE.search(url.lower()) else 0
+    try:
+        resp = await context.request.get(
+            url, headers={"Referer": referrer, "User-Agent": USER_AGENT}, timeout=10000
+        )
+        text = await resp.text()
+    except Exception:
+        return score - 10
+
+    if "#EXT-X-STREAM-INF" in text:
+        inf_lines = [l for l in text.splitlines() if l.startswith("#EXT-X-STREAM-INF")]
+        has_video = any("RESOLUTION=" in l or VIDEO_CODEC_RE.search(l) for l in inf_lines)
+        score += 100 if has_video else -100
+    elif "#EXTINF" in text:
+        segs = [l for l in text.splitlines() if l and not l.startswith("#")]
+        if segs and all(AUDIO_SEG_RE.search(s) for s in segs):
+            score -= 100  # media playlist made only of audio segments
+        else:
+            score += 10
+    return score
+
+
+async def pick_best(context, candidates, referrer):
+    if not candidates:
+        return None
+    scored = []
     for url in candidates:
-        if re.search(r"(master|playlist|index|manifest)", url.lower()):
-            return url
-    return candidates[0] if candidates else None
+        scored.append((await score_candidate(context, url, referrer), url))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best_score, best_url = scored[0]
+    if best_score <= -100:
+        print(f"       only audio-only playlists found, skipping: {best_url}")
+        return None
+    return best_url
 
 
 async def try_start_playback(page):
@@ -158,9 +199,9 @@ async def scrape_one(browser, name, url, group):
                 await asyncio.sleep(0.5)
                 waited += 0.5
             if candidates:
-                await asyncio.sleep(2)  # let a master playlist show up
+                await asyncio.sleep(5)  # let the master / video playlists show up
 
-            stream = pick_best(candidates)
+            stream = await pick_best(context, candidates, url)
 
             # Fallback: m3u8 URL embedded in page source
             if not stream:
@@ -214,25 +255,45 @@ async def scrape_all():
     return results
 
 
-def write_m3u(entries):
-    # Sort alphabetically by tvg-name (case-insensitive)
-    entries = sorted(entries, key=lambda e: e["name"].casefold())
+def build_playlist(entries, style):
+    """
+    style:
+      generic   - plain M3U + #EXTVLCOPT headers (dragon.m3u8)
+      vlc       - #EXTVLCOPT referrer / user-agent lines
+      tivimate  - pipe headers: url|User-Agent=...&Referer=...
+      jellyfin  - plain URLs only (Jellyfin ignores per-stream headers), + tvg-chno
+    """
     repo = os.environ.get("GITHUB_REPOSITORY", "")
     branch = os.environ.get("GITHUB_REF_NAME", "main")
     header = "#EXTM3U"
     if repo:
-        header += f' x-tvg-url="https://raw.githubusercontent.com/{repo}/{branch}/{OUT_XML}"'
+        epg = f"https://raw.githubusercontent.com/{repo}/{branch}/{OUT_XML}"
+        header += f' x-tvg-url="{epg}" url-tvg="{epg}"'
     lines = [header]
-    for e in entries:
+
+    for num, e in enumerate(entries, start=1):
+        chno = f' tvg-chno="{num}"' if style == "jellyfin" else ""
         lines.append(
-            f'#EXTINF:-1 tvg-id="{e["tvg_id"]}" tvg-name="{e["name"]}" '
+            f'#EXTINF:-1 tvg-id="{e["tvg_id"]}" tvg-name="{e["name"]}"{chno} '
             f'tvg-logo="{e["logo"]}" group-title="{e["group"]}",{e["name"]}'
         )
-        lines.append(f'#EXTVLCOPT:http-referrer={e["referrer"]}')
-        lines.append(f'#EXTVLCOPT:http-user-agent={USER_AGENT}')
-        lines.append(e["url"])
-    with open(OUT_M3U, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+        if style in ("generic", "vlc"):
+            lines.append(f'#EXTVLCOPT:http-referrer={e["referrer"]}')
+            lines.append(f'#EXTVLCOPT:http-user-agent={USER_AGENT}')
+            lines.append(e["url"])
+        elif style == "tivimate":
+            lines.append(f'{e["url"]}|User-Agent={USER_AGENT}&Referer={e["referrer"]}')
+        else:  # jellyfin
+            lines.append(e["url"])
+    return "\n".join(lines) + "\n"
+
+
+def write_m3u(entries):
+    # Sort alphabetically by tvg-name (case-insensitive)
+    entries = sorted(entries, key=lambda e: e["name"].casefold())
+    for path, style in OUTPUT_PLAYLISTS.items():
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(build_playlist(entries, style))
     return entries
 
 
@@ -273,8 +334,9 @@ def main():
         sys.exit(1)
     entries = write_m3u(entries)
     write_epg(entries)
-    print(f"\nWrote {len(entries)}/{len(CHANNELS)} channels to {OUT_M3U} and {OUT_XML}")
+    print(f"\nWrote {len(entries)}/{len(CHANNELS)} channels to {', '.join(OUTPUT_PLAYLISTS)} and {OUT_XML}")
 
 
 if __name__ == "__main__":
     main()
+ 
