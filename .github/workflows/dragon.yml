@@ -1,0 +1,48 @@
+name: Update Dragon Playlist
+
+on:
+  schedule:
+    - cron: "0 */4 * * *"   # every 4 hours
+  workflow_dispatch:         # manual run button
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dragon-update
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: Run scraper
+        run: python dragon_scraper.py
+
+      - name: Commit and push changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add dragon.m3u8 dragon.xml.gz
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update dragon playlist $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git push
+          fi
